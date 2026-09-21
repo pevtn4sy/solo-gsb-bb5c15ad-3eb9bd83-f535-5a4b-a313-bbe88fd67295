@@ -82,6 +82,13 @@ pytest -q
 - 结果中包含两个 SHA-256 内容哈希：每个传感器的 `segments_hash`
   和整批的 `timeline_hash`，可用于比对一致性与去重校验。
 - 相邻且状态、值、单位、来源修订完全相同的片段会被合并；来源修订不同则保留边界。
+- **采样点查询**（见 4.3）直接复用上述折叠结果判断单个纳秒时刻：
+  落在 `calibrated` 片段上返回有效值与单位，落在 `withdrawn` 墓碑上返回
+  `withdrawn` 且 `value=null`，所有已落地片段之外为 `uncovered`；
+  若该时刻被某个 **blocked** 修订覆盖，则即使已有 grounded 片段也报告
+  `blocked`（补传缺失祖先可能改变折叠赢家），并在 `missing_ancestors`
+  中按字典序列出沿父链追溯到的、尚未上传的末端祖先，可直接照单补传。
+  成环（invalid）修订不影响采样判定。
 
 ---
 
@@ -119,6 +126,61 @@ pytest -q
 返回该批次所有传感器的有效时间线、缺口清单、修订计数与整批哈希；
 批次不存在返回 `404`。
 
+### `GET /api/v1/batches/{batch_id}/sensors/{sensor_id}/sample?timestamp_ns=N` — 查询单个采样时刻
+
+按 `batch_id`、`sensor_id` 与纳秒时刻 `timestamp_ns`（非负整数，半开区间）
+查询该时刻的有效标定状态：
+
+| `state`       | 含义                                                                 |
+| ------------- | -------------------------------------------------------------------- |
+| `calibrated`  | 折叠赢家是已落地的值片段；`value`/`unit` 有效                         |
+| `withdrawn`   | 折叠赢家是撤回墓碑；`value`/`unit` 为 `null`                          |
+| `uncovered`   | 没有任何已落地片段覆盖该时刻                                          |
+| `blocked`     | 该时刻被尚未落地的修订覆盖；补传后赢家可能改变，列出 `missing_ancestors` |
+
+解析成功时（`calibrated` / `withdrawn`）还返回：
+
+- `revision_id`：该时刻的获胜修订（确定性折叠中最后应用者）；
+- `parent_chain`：从获胜修订回溯到根的**有序**父链，含首尾，
+  例如 `["v3", "v2", "v1", "ROOT"]`。
+
+`blocked` 时 `revision_id`、`value`、`unit` 为 `null`，`parent_chain` 为空，
+`missing_ancestors` 按字典序列出去重后的缺失末端祖先。
+未知批次或未知传感器返回 `404`；`timestamp_ns < 0` 返回 `422`。
+
+示例（沿用第 5 节的 B42 / S1：v2 覆盖 [100,200)、v1 覆盖 [0,300)）：
+
+```bash
+$ curl -s 'localhost:8080/api/v1/batches/B42/sensors/S1/sample?timestamp_ns=150'
+{
+  "batch_id": "B42",
+  "sensor_id": "S1",
+  "timestamp_ns": 150,
+  "state": "calibrated",
+  "value": 3.5,
+  "unit": "C",
+  "revision_id": "v2",
+  "parent_chain": ["v2", "v1", "ROOT"],
+  "missing_ancestors": []
+}
+```
+
+父版本 `v1` 缺失时查询同一时刻：
+
+```json
+{
+  "batch_id": "B42",
+  "sensor_id": "S1",
+  "timestamp_ns": 150,
+  "state": "blocked",
+  "value": null,
+  "unit": null,
+  "revision_id": null,
+  "parent_chain": [],
+  "missing_ancestors": ["v1"]
+}
+```
+
 ### `POST /admin/reset` — 清空全部内存状态
 
 返回被清除的批次数与事件数。
@@ -145,8 +207,11 @@ curl -s -X POST localhost:8080/api/v1/batches/B42/events \
   -d '{"batch_id":"B42","sensor_id":"S1","revision_id":"v1","parent_id":"ROOT",
        "idempotency_key":"e1","start_ns":0,"end_ns":300,"value":1.0,"unit":"C"}'
 
-# 4) 查询 / 重置
+# 4) 查询 / 采样点查询 / 重置
 curl -s localhost:8080/api/v1/batches/B42/result
+curl -s 'localhost:8080/api/v1/batches/B42/sensors/S1/sample?timestamp_ns=150'
+#   -> state="calibrated", value=3.5, revision_id="v2",
+#      parent_chain=["v2","v1","ROOT"]
 curl -s -X POST localhost:8080/admin/reset
 ```
 
@@ -167,12 +232,12 @@ curl -s -X POST localhost:8080/admin/reset
 ```
 .
 ├── app/
-│   ├── main.py       # FastAPI 路由：ingest / result / reset / health
-│   ├── engine.py     # 因果分类、区间切分折叠、缺口与哈希（纯函数引擎）
+│   ├── main.py       # FastAPI 路由：ingest / result / sample / reset / health
+│   ├── engine.py     # 因果分类、区间切分折叠、采样点查询、缺口与哈希（纯函数引擎）
 │   ├── storage.py    # 线程安全的内存存储与幂等判定
 │   ├── models.py     # Pydantic 请求/响应模型与校验
 │   └── config.py     # CAL_ 前缀环境变量配置
-├── tests/            # pytest（API 端到端 + 引擎单测，共 20 个用例）
+├── tests/            # pytest（API 端到端 + 引擎单测，共 32 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

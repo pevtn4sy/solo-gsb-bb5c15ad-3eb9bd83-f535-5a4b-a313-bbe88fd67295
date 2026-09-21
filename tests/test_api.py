@@ -191,3 +191,118 @@ def test_abutting_half_open_intervals_do_not_duplicate(client):
     r = _post(client, _event("b", "a", 10, 20, value=2.0, key="b"))
     segs = r.json()["result"]["sensors"][0]["segments"]
     assert [(s["start_ns"], s["end_ns"]) for s in segs] == [(0, 10), (10, 20)]
+
+
+# ---------------------------------------------------------------------------
+# Sample-point lookup
+# ---------------------------------------------------------------------------
+
+
+def _sample(client, ts, batch="B1", sensor="S1"):
+    return client.get(
+        f"/api/v1/batches/{batch}/sensors/{sensor}/sample",
+        params={"timestamp_ns": ts},
+    )
+
+
+def test_sample_calibrated_returns_value_unit_winner_and_parent_chain(client):
+    _post(client, _event("v1", "ROOT", 0, 100, value=1.0, unit="mm"))
+    _post(client, _event("v2", "v1", 10, 20, value=2.0))
+
+    inside = _sample(client, 15).json()
+    assert inside["state"] == "calibrated"
+    assert inside["value"] == 2.0
+    assert inside["unit"] == "mm"
+    assert inside["revision_id"] == "v2"
+    assert inside["parent_chain"] == ["v2", "v1", "ROOT"]
+    assert inside["missing_ancestors"] == []
+
+    outside_child = _sample(client, 50).json()
+    assert outside_child["state"] == "calibrated"
+    assert outside_child["value"] == 1.0
+    assert outside_child["revision_id"] == "v1"
+    assert outside_child["parent_chain"] == ["v1", "ROOT"]
+
+
+def test_sample_half_open_boundaries(client):
+    _post(client, _event("v1", "ROOT", 0, 100, value=1.0))
+    _post(client, _event("v2", "v1", 10, 20, value=2.0))
+    assert _sample(client, 10).json()["revision_id"] == "v2"
+    # End boundary belongs to the enclosing revision.
+    assert _sample(client, 20).json()["revision_id"] == "v1"
+
+
+def test_sample_withdrawn_point(client):
+    _post(client, _event("v1", "ROOT", 0, 100, value=1.0))
+    _post(client, _event("v2", "v1", 0, 100, value=2.0))
+    _post(client, _event("w", "v2", 30, 70, withdrawn=True, value=None))
+    body = _sample(client, 50).json()
+    assert body["state"] == "withdrawn"
+    assert body["value"] is None
+    assert body["unit"] is None
+    assert body["revision_id"] == "w"
+    assert body["parent_chain"] == ["w", "v2", "v1", "ROOT"]
+
+
+def test_sample_uncovered_point(client):
+    _post(client, _event("v1", "ROOT", 0, 100, value=1.0))
+    body = _sample(client, 500).json()
+    assert body["state"] == "uncovered"
+    assert body["value"] is None
+    assert body["revision_id"] is None
+    assert body["parent_chain"] == []
+    assert body["missing_ancestors"] == []
+
+
+def test_sample_blocked_lists_missing_ancestor(client):
+    _post(client, _event("v2", "v1", 10, 20, value=2.0))
+    body = _sample(client, 15).json()
+    assert body["state"] == "blocked"
+    assert body["missing_ancestors"] == ["v1"]
+    assert body["value"] is None
+    assert body["revision_id"] is None
+    assert body["parent_chain"] == []
+    # An instant the blocked revision does not cover is simply uncovered.
+    assert _sample(client, 99).json()["state"] == "uncovered"
+
+
+def test_sample_blocked_takes_precedence_over_grounded_coverage(client):
+    _post(client, _event("r", "ROOT", 0, 100, value=1.0))
+    _post(client, _event("orphan", "ghost", 40, 60, value=9.0, key="ko"))
+    body = _sample(client, 50).json()
+    assert body["state"] == "blocked"
+    assert body["missing_ancestors"] == ["ghost"]
+
+
+def test_sample_blocked_collects_distinct_terminal_ancestors(client):
+    # o1 -> g1 and o2 -> g2; both cover t=7, and a longer chain ends at v1.
+    _post(client, _event("o1", "g1", 0, 10, value=1.0, key="ko1"))
+    _post(client, _event("o2", "g2", 5, 15, value=2.0, key="ko2"))
+    _post(client, _event("v3", "v2", 6, 8, value=3.0, key="kv3"))
+    _post(client, _event("v2", "v1", 0, 9, value=2.5, key="kv2"))
+    body = _sample(client, 7).json()
+    assert body["state"] == "blocked"
+    assert body["missing_ancestors"] == ["g1", "g2", "v1"]
+
+
+def test_sample_blocked_resolves_after_backfill(client):
+    _post(client, _event("v2", "v1", 10, 20, value=2.0))
+    assert _sample(client, 15).json()["state"] == "blocked"
+    _post(client, _event("v1", "ROOT", 0, 100, value=1.0))
+    body = _sample(client, 15).json()
+    assert body["state"] == "calibrated"
+    assert body["revision_id"] == "v2"
+    assert body["parent_chain"] == ["v2", "v1", "ROOT"]
+
+
+def test_sample_unknown_batch_or_sensor_404(client):
+    assert _sample(client, 0, batch="NOPE").status_code == 404
+    _post(client, _event("v1", "ROOT", 0, 10, value=1.0, sensor="SX", key="kx"))
+    assert _sample(client, 0, sensor="SY").status_code == 404
+    client.post("/admin/reset")
+    assert _sample(client, 0).status_code == 404
+
+
+def test_sample_rejects_negative_timestamp(client):
+    r = client.get("/api/v1/batches/B1/sensors/S1/sample", params={"timestamp_ns": -1})
+    assert r.status_code == 422

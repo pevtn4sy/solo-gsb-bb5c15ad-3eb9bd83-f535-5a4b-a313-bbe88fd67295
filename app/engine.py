@@ -283,11 +283,116 @@ def hash_batch(sensor_payloads: list[dict]) -> str:
 # ---------------------------------------------------------------------------
 
 
-def evaluate_batch(batch_id: str, store: BatchStore) -> dict:
-    """Compute the complete, deterministic result document for one batch."""
+def group_by_sensor(store: BatchStore) -> dict[str, dict[str, StoredEvent]]:
+    """Group every stored revision of a batch by its owning sensor."""
     by_sensor: dict[str, dict[str, StoredEvent]] = {}
     for event in store.events.values():
         by_sensor.setdefault(event.sensor_id, {})[event.revision_id] = event
+    return by_sensor
+
+
+def _parent_chain(revision_id: str, events: dict[str, StoredEvent]) -> list[str]:
+    """Ordered chain from ``revision_id`` to ``ROOT`` inclusive.
+
+    The revision itself is first and the literal ``"ROOT"`` is last. Only
+    called for grounded revisions, so every parent hop is known.
+    """
+    chain = [revision_id]
+    parent = events[revision_id].parent_id
+    while parent != ROOT_PARENT:
+        chain.append(parent)
+        parent = events[parent].parent_id
+    chain.append(ROOT_PARENT)
+    return chain
+
+
+def query_sample(
+    sensor_id: str,
+    timestamp_ns: int,
+    sensor_events: dict[str, StoredEvent],
+    states: dict[str, str],
+    depths: dict[str, int],
+) -> dict:
+    """Resolve one sample instant of one sensor.
+
+    Blocking takes precedence: if any known-but-not-grounded revision covers
+    the instant, backfilling its missing ancestors could change which revision
+    wins the deterministic fold at that point, so the point is reported as
+    ``blocked`` with the distinct missing ancestors that must be uploaded.
+    Otherwise the instant is looked up in the folded effective timeline,
+    reusing the exact same fold order as the full batch result.
+    """
+    covering_blocked = sorted(
+        rev
+        for rev, event in sensor_events.items()
+        if states[rev] == BLOCKED
+        and event.start_ns <= timestamp_ns < event.end_ns
+    )
+    if covering_blocked:
+        missing: set[str] = set()
+        for rev in covering_blocked:
+            parent = sensor_events[rev].parent_id
+            while parent != ROOT_PARENT and parent in sensor_events:
+                parent = sensor_events[parent].parent_id
+            if parent != ROOT_PARENT:
+                missing.add(parent)
+        return {
+            "sensor_id": sensor_id,
+            "timestamp_ns": timestamp_ns,
+            "state": "blocked",
+            "value": None,
+            "unit": None,
+            "revision_id": None,
+            "parent_chain": [],
+            "missing_ancestors": sorted(missing),
+        }
+
+    grounded_events = [
+        e for e in sensor_events.values() if states[e.revision_id] == GROUNDED
+    ]
+    segments = build_timeline(grounded_events, depths)
+    for seg in segments:
+        if seg.start_ns <= timestamp_ns < seg.end_ns:
+            return {
+                "sensor_id": sensor_id,
+                "timestamp_ns": timestamp_ns,
+                "state": seg.state,
+                "value": seg.value,
+                "unit": seg.unit,
+                "revision_id": seg.revision_id,
+                "parent_chain": _parent_chain(seg.revision_id, sensor_events),
+                "missing_ancestors": [],
+            }
+
+    return {
+        "sensor_id": sensor_id,
+        "timestamp_ns": timestamp_ns,
+        "state": "uncovered",
+        "value": None,
+        "unit": None,
+        "revision_id": None,
+        "parent_chain": [],
+        "missing_ancestors": [],
+    }
+
+
+def evaluate_sample(
+    batch_id: str, sensor_id: str, timestamp_ns: int, store: BatchStore
+) -> Optional[dict]:
+    """Compute the sample-point document; ``None`` when the sensor is unknown."""
+    by_sensor = group_by_sensor(store)
+    sensor_events = by_sensor.get(sensor_id)
+    if sensor_events is None:
+        return None
+    states, depths = classify_sensor(sensor_events)
+    doc = query_sample(sensor_id, timestamp_ns, sensor_events, states, depths)
+    doc = {"batch_id": batch_id, **doc}
+    return doc
+
+
+def evaluate_batch(batch_id: str, store: BatchStore) -> dict:
+    """Compute the complete, deterministic result document for one batch."""
+    by_sensor = group_by_sensor(store)
 
     sensors_out: list[dict] = []
     gaps_out: list[dict] = []

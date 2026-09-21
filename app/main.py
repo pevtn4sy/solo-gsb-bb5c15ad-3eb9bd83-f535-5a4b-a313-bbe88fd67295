@@ -1,22 +1,23 @@
-"""FastAPI application: ingest, query and reset endpoints."""
+"""FastAPI application: ingest, timeline/sample query and reset endpoints."""
 
 from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
 from .config import get_settings
-from .engine import evaluate_batch
+from .engine import evaluate_batch, evaluate_sample
 from .models import (
     BatchResult,
     HealthResponse,
     IngestResponse,
     MeasurementEvent,
     ResetResponse,
+    SamplePointResponse,
 )
 from .storage import EventStore, IdempotencyConflict, StoredEvent
 
@@ -121,6 +122,35 @@ def get_result(batch_id: str) -> BatchResult:
     with store.lock:
         result = evaluate_batch(batch_id, batch)
     return BatchResult(**result)
+
+
+@app.get(
+    "/api/v1/batches/{batch_id}/sensors/{sensor_id}/sample",
+    response_model=SamplePointResponse,
+    tags=["calibration"],
+    summary="Query the effective calibration state at one nanosecond",
+    responses={404: {"description": "Unknown batch or sensor"}},
+)
+def get_sample(
+    batch_id: str,
+    sensor_id: str,
+    timestamp_ns: int = Query(
+        ...,
+        ge=0,
+        description="Batch-local nanosecond instant to resolve (half-open intervals).",
+    ),
+) -> SamplePointResponse:
+    batch = store.get_batch(batch_id)
+    if batch is None or not batch.events:
+        raise HTTPException(status_code=404, detail=f"batch {batch_id!r} not found")
+    with store.lock:
+        doc = evaluate_sample(batch_id, sensor_id, timestamp_ns, batch)
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"sensor {sensor_id!r} not found in batch {batch_id!r}",
+        )
+    return SamplePointResponse(**doc)
 
 
 @app.post(

@@ -1,6 +1,14 @@
 """Engine unit tests: causal classification, folding order and cycles."""
 
-from app.engine import BLOCKED, GROUNDED, INVALID, build_timeline, classify_sensor, evaluate_batch
+from app.engine import (
+    BLOCKED,
+    GROUNDED,
+    INVALID,
+    build_timeline,
+    classify_sensor,
+    evaluate_batch,
+    query_sample,
+)
 from app.storage import BatchStore, StoredEvent
 
 
@@ -85,3 +93,36 @@ def test_blocked_events_excluded_from_timeline_and_hash_stable():
     assert sensor["segments"][0]["value"] == 7.0
     assert doc1["revisions_blocked"] == 1
     assert doc1["complete"] is False
+
+
+def test_query_sample_uses_same_fold_and_half_open_rule():
+    events = {
+        "root": _ev("root", "ROOT", 0, 100, value=0),
+        "a": _ev("a", "root", 20, 40, value=1),
+        "b": _ev("b", "root", 10, 30, value=2),
+    }
+    states, depths = classify_sensor(events)
+    # Same-depth overlap [20,30): larger id "b" wins, exactly like the fold.
+    at25 = query_sample("S", 25, events, states, depths)
+    assert at25["state"] == "calibrated"
+    assert at25["value"] == 2.0 and at25["revision_id"] == "b"
+    assert at25["parent_chain"] == ["b", "root", "ROOT"]
+    # End boundary of b/a window: [30,40) belongs to "a".
+    assert query_sample("S", 30, events, states, depths)["revision_id"] == "a"
+    assert query_sample("S", 100, events, states, depths)["state"] == "uncovered"
+
+
+def test_query_sample_blocked_wins_over_grounded_and_skips_invalid():
+    events = {
+        "root": _ev("root", "ROOT", 0, 100, value=0),
+        "orphan": _ev("orphan", "ghost", 0, 50, value=9),
+        "c1": _ev("c1", "c2", 80, 90, value=3),
+        "c2": _ev("c2", "c1", 80, 90, value=4),
+    }
+    states, depths = classify_sensor(events)
+    blocked_point = query_sample("S", 20, events, states, depths)
+    assert blocked_point["state"] == "blocked"
+    assert blocked_point["missing_ancestors"] == ["ghost"]
+    # A point covered only by invalid (cyclic) revisions is resolved normally.
+    assert query_sample("S", 85, events, states, depths)["value"] == 0.0
+    assert query_sample("S", 85, events, states, depths)["revision_id"] == "root"

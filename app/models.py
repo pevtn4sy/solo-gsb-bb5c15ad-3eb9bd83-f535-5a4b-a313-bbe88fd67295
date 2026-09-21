@@ -95,6 +95,32 @@ class BatchResult(StrictModel):
     timeline_hash: str
 
 
+class SamplePointResponse(StrictModel):
+    """Effective calibration state at one queried nanosecond of one sensor."""
+
+    batch_id: str
+    sensor_id: str
+    timestamp_ns: int
+    # calibrated: a grounded, value-bearing segment wins the fold at the point;
+    # withdrawn:   a tombstone segment wins (value/unit are null);
+    # uncovered:   no grounded segment covers the instant;
+    # blocked:     a revision covering the instant is waiting on missing
+    #              ancestors, so the eventual winner cannot yet be determined.
+    state: Literal["calibrated", "withdrawn", "uncovered", "blocked"]
+    # Populated only for calibrated points; null otherwise.
+    value: Optional[float] = None
+    unit: Optional[str] = None
+    # Winning revision (last applied in deterministic fold order); null unless
+    # the state is calibrated/withdrawn.
+    revision_id: Optional[str] = None
+    # Ordered parent chain from revision_id back to the causal root, e.g.
+    # ["v3", "v2", "v1", "ROOT"]; empty unless the point is resolved.
+    parent_chain: list[str] = Field(default_factory=list)
+    # Distinct not-yet-uploaded revisions that block every covering revision;
+    # populated only for blocked points (sorted, ready for backfill).
+    missing_ancestors: list[str] = Field(default_factory=list)
+
+
 class IngestResponse(StrictModel):
     status: Literal["accepted", "duplicate", "conflict"]
     idempotency_key: str
