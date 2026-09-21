@@ -82,6 +82,9 @@ pytest -q
 - 结果中包含两个 SHA-256 内容哈希：每个传感器的 `segments_hash`
   和整批的 `timeline_hash`，可用于比对一致性与去重校验。
 - 相邻且状态、值、单位、来源修订完全相同的片段会被合并；来源修订不同则保留边界。
+- **单点查询（sample）复用同一套折叠规则**：某时刻被落地片段覆盖时返回
+  `calibrated`/`withdrawn`；仅被 blocked 修订覆盖（父链有缺口、未落地）时返回
+  `blocked` 并列出缺失祖先；invalid（环）修订视为不覆盖，与批次结果完全一致。
 
 ---
 
@@ -119,6 +122,25 @@ pytest -q
 返回该批次所有传感器的有效时间线、缺口清单、修订计数与整批哈希；
 批次不存在返回 `404`。
 
+### `GET /api/v1/batches/{batch_id}/sensors/{sensor_id}/sample?timestamp_ns=<ns>` — 查询单个纳秒时刻
+
+按 `batch_id` + `sensor_id` + 查询参数 `timestamp_ns`（纳秒整数，≥0）查询
+某一采样时刻的有效状态，复用与批次结果完全相同的确定性折叠规则：
+
+- `status="calibrated"`：该时刻被落地片段覆盖，返回有效 `value`/`unit`、
+  获胜 `revision_id` 及 `parent_chain`；
+- `status="withdrawn"`：该时刻被撤回墓碑擦除，`value`/`unit` 为 null，
+  `revision_id` 为生效的撤回修订；
+- `status="blocked"`：该时刻只被缺口修订覆盖（父链未落地，不参与时间线）。
+  `missing_ancestors` 按字典序列出需要补传的缺失祖先（所有覆盖该点的受阻
+  修订之并集、去重）；`revision_id`/`parent_chain` 给出按折叠顺序（相对缺失
+  祖先的深度优先、同深度按 id 字典序）选出的代表性受阻修订及其已知祖先前缀；
+- `status="uncovered"`：该时刻无任何可用覆盖，`revision_id` 为 null。
+
+`parent_chain` 从获胜修订本身开始，沿 `parent_id` 逐级回溯，最后一个元素是
+父代为 `"ROOT"` 的根修订（blocked 时结束于缺失祖先之前的最后一个已知修订）。
+批次或传感器不存在返回 `404`；`timestamp_ns` 缺失或为负数返回 `422`。
+
 ### `POST /admin/reset` — 清空全部内存状态
 
 返回被清除的批次数与事件数。
@@ -136,6 +158,11 @@ curl -s -X POST localhost:8080/api/v1/batches/B42/events \
   -d '{"batch_id":"B42","sensor_id":"S1","revision_id":"v2","parent_id":"v1",
        "idempotency_key":"e2","start_ns":100,"end_ns":200,"value":3.5,"unit":"C"}'
 
+# 1b) 此时单点查询 t=150：只被受阻的 v2 覆盖
+#     → {"status":"blocked","revision_id":"v2","parent_chain":["v2"],
+#        "missing_ancestors":["v1"], ...}
+curl -s 'localhost:8080/api/v1/batches/B42/sensors/S1/sample?timestamp_ns=150'
+
 # 2) 同一请求重放 → "status":"duplicate"，结果不变
 
 # 3) 按缺口清单补传父版本 v1（根）→ complete=true，时间线变为
@@ -144,6 +171,11 @@ curl -s -X POST localhost:8080/api/v1/batches/B42/events \
   -H 'Content-Type: application/json' \
   -d '{"batch_id":"B42","sensor_id":"S1","revision_id":"v1","parent_id":"ROOT",
        "idempotency_key":"e1","start_ns":0,"end_ns":300,"value":1.0,"unit":"C"}'
+
+# 3b) 再次查询 t=150
+#     → {"status":"calibrated","value":3.5,"unit":"C","revision_id":"v2",
+#        "parent_chain":["v2","v1"], ...}
+curl -s 'localhost:8080/api/v1/batches/B42/sensors/S1/sample?timestamp_ns=150'
 
 # 4) 查询 / 重置
 curl -s localhost:8080/api/v1/batches/B42/result
@@ -167,12 +199,12 @@ curl -s -X POST localhost:8080/admin/reset
 ```
 .
 ├── app/
-│   ├── main.py       # FastAPI 路由：ingest / result / reset / health
-│   ├── engine.py     # 因果分类、区间切分折叠、缺口与哈希（纯函数引擎）
+│   ├── main.py       # FastAPI 路由：ingest / result / sample / reset / health
+│   ├── engine.py     # 因果分类、区间切分折叠、单点采样、缺口与哈希（纯函数引擎）
 │   ├── storage.py    # 线程安全的内存存储与幂等判定
 │   ├── models.py     # Pydantic 请求/响应模型与校验
 │   └── config.py     # CAL_ 前缀环境变量配置
-├── tests/            # pytest（API 端到端 + 引擎单测，共 20 个用例）
+├── tests/            # pytest（API 端到端 + 引擎单测，共 31 个用例）
 ├── Dockerfile
 ├── docker-compose.yml
 ├── requirements.txt

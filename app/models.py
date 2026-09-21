@@ -104,6 +104,27 @@ class IngestResponse(StrictModel):
     result: BatchResult
 
 
+class SampleResponse(StrictModel):
+    """Effective state of one sensor at a single nanosecond instant."""
+
+    batch_id: str
+    sensor_id: str
+    timestamp_ns: int
+    status: Literal["calibrated", "withdrawn", "uncovered", "blocked"]
+    # Effective value and unit; populated only when status is "calibrated".
+    value: Optional[float] = None
+    unit: Optional[str] = None
+    # Winning revision (for "blocked": the featured blocked revision);
+    # null only when status is "uncovered".
+    revision_id: Optional[str] = None
+    # Lineage from the winning revision (first element) back along parent_id
+    # to the root revision (last element, its parent is the literal "ROOT").
+    # For "blocked" it is the known prefix ending before the missing ancestor.
+    parent_chain: list[str] = Field(default_factory=list)
+    # Missing ancestor revision ids to backfill; populated for "blocked".
+    missing_ancestors: list[str] = Field(default_factory=list)
+
+
 class ResetResponse(StrictModel):
     status: Literal["reset"]
     batches_removed: int

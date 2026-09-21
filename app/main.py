@@ -4,19 +4,21 @@ from __future__ import annotations
 
 import logging
 from contextlib import asynccontextmanager
+from typing import Annotated
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse
 
 from . import __version__
 from .config import get_settings
-from .engine import evaluate_batch
+from .engine import evaluate_batch, sample_sensor
 from .models import (
     BatchResult,
     HealthResponse,
     IngestResponse,
     MeasurementEvent,
     ResetResponse,
+    SampleResponse,
 )
 from .storage import EventStore, IdempotencyConflict, StoredEvent
 
@@ -121,6 +123,44 @@ def get_result(batch_id: str) -> BatchResult:
     with store.lock:
         result = evaluate_batch(batch_id, batch)
     return BatchResult(**result)
+
+
+@app.get(
+    "/api/v1/batches/{batch_id}/sensors/{sensor_id}/sample",
+    response_model=SampleResponse,
+    tags=["calibration"],
+    summary="Query the effective state at one nanosecond instant",
+    responses={404: {"description": "Unknown batch or sensor"}},
+)
+def get_sample(
+    batch_id: str,
+    sensor_id: str,
+    timestamp_ns: Annotated[
+        int,
+        Query(ge=0, description="Nanosecond instant to sample (half-open lookup)"),
+    ],
+) -> SampleResponse:
+    """Point-query the deterministic effective timeline of one sensor.
+
+    Returns ``calibrated``/``withdrawn`` with the winning revision and its
+    parent chain back to the root, ``blocked`` (with the missing ancestors to
+    backfill) when only gap-blocked revisions cover the instant, or
+    ``uncovered`` when nothing usable covers it.
+    """
+    with store.lock:
+        batch = store.get_batch(batch_id)
+        if batch is None or not batch.events:
+            raise HTTPException(status_code=404, detail=f"batch {batch_id!r} not found")
+        sensor_events = {
+            rid: e for rid, e in batch.events.items() if e.sensor_id == sensor_id
+        }
+        if not sensor_events:
+            raise HTTPException(
+                status_code=404,
+                detail=f"sensor {sensor_id!r} not found in batch {batch_id!r}",
+            )
+        result = sample_sensor(batch_id, sensor_id, sensor_events, timestamp_ns)
+    return SampleResponse(**result)
 
 
 @app.post(

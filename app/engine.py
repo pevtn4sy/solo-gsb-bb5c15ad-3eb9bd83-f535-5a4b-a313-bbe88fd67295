@@ -245,6 +245,140 @@ def collect_gaps(
 
 
 # ---------------------------------------------------------------------------
+# Point sampling
+# ---------------------------------------------------------------------------
+
+
+def _known_chain(events: dict[str, StoredEvent], revision_id: str) -> list[str]:
+    """Revision ids from ``revision_id`` upward while parents are known.
+
+    For grounded revisions the chain ends at the root revision (whose parent
+    is the literal ``ROOT``); for blocked ones it ends at the last known
+    revision before the missing ancestor.
+    """
+    chain = [revision_id]
+    seen = {revision_id}
+    cur = events[revision_id]
+    while (
+        cur.parent_id != ROOT_PARENT
+        and cur.parent_id in events
+        and cur.parent_id not in seen
+    ):
+        chain.append(cur.parent_id)
+        seen.add(cur.parent_id)
+        cur = events[cur.parent_id]
+    return chain
+
+
+def _missing_ancestor(
+    events: dict[str, StoredEvent], revision_id: str
+) -> Optional[str]:
+    """First unknown parent id above ``revision_id`` (None when grounded)."""
+    cur = events[revision_id]
+    seen = {revision_id}
+    while cur.parent_id != ROOT_PARENT and cur.parent_id not in seen:
+        if cur.parent_id not in events:
+            return cur.parent_id
+        seen.add(cur.parent_id)
+        cur = events[cur.parent_id]
+    return None
+
+
+def _local_depth(events: dict[str, StoredEvent], revision_id: str) -> int:
+    """Hops from ``revision_id`` up to its nearest missing ancestor.
+
+    Only used to order blocked revisions the same way causal depth orders
+    grounded ones: deeper descendants are applied later and win.
+    """
+    depth = 0
+    cur = events[revision_id]
+    seen = {revision_id}
+    while (
+        cur.parent_id != ROOT_PARENT
+        and cur.parent_id in events
+        and cur.parent_id not in seen
+    ):
+        depth += 1
+        seen.add(cur.parent_id)
+        cur = events[cur.parent_id]
+    return depth
+
+
+def sample_sensor(
+    batch_id: str,
+    sensor_id: str,
+    sensor_events: dict[str, StoredEvent],
+    timestamp_ns: int,
+) -> dict:
+    """Point-query one sensor's effective timeline at ``timestamp_ns``.
+
+    Reuses the deterministic fold (:func:`classify_sensor` +
+    :func:`build_timeline`), so the answer always agrees with the batch
+    timeline produced by :func:`evaluate_batch`. Statuses:
+
+    * ``calibrated`` / ``withdrawn`` - a grounded segment covers the instant;
+      the winning revision and its parent chain back to the root are returned;
+    * ``blocked`` - no grounded coverage, but at least one blocked revision's
+      interval covers the instant; the missing ancestors to backfill are
+      reported (sorted union across all covering blocked revisions), along
+      with a featured revision chosen by the fold's own ordering (deeper
+      relative to the missing ancestor first, larger id wins ties);
+    * ``uncovered`` - nothing usable covers the instant (invalid revisions,
+      e.g. parent cycles, never cover).
+    """
+    states, depths = classify_sensor(sensor_events)
+    grounded = [e for e in sensor_events.values() if states[e.revision_id] == GROUNDED]
+    segments = build_timeline(grounded, depths)
+
+    result = {
+        "batch_id": batch_id,
+        "sensor_id": sensor_id,
+        "timestamp_ns": timestamp_ns,
+        "value": None,
+        "unit": None,
+        "revision_id": None,
+        "parent_chain": [],
+        "missing_ancestors": [],
+    }
+
+    for seg in segments:
+        if seg.start_ns <= timestamp_ns < seg.end_ns:
+            result.update(
+                status=seg.state,
+                value=seg.value,
+                unit=seg.unit,
+                revision_id=seg.revision_id,
+                parent_chain=_known_chain(sensor_events, seg.revision_id),
+            )
+            return result
+
+    covering = [
+        e
+        for e in sensor_events.values()
+        if states[e.revision_id] == BLOCKED
+        and e.start_ns <= timestamp_ns < e.end_ns
+    ]
+    if covering:
+        winner = max(
+            covering,
+            key=lambda e: (_local_depth(sensor_events, e.revision_id), e.revision_id),
+        )
+        missing_ids = {
+            _missing_ancestor(sensor_events, e.revision_id) for e in covering
+        }
+        result.update(
+            status=BLOCKED,
+            revision_id=winner.revision_id,
+            parent_chain=_known_chain(sensor_events, winner.revision_id),
+            missing_ancestors=sorted(m for m in missing_ids if m is not None),
+        )
+        return result
+
+    result["status"] = "uncovered"
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Hashing / serialization
 # ---------------------------------------------------------------------------
 
